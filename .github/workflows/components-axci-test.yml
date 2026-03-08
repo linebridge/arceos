@@ -1,0 +1,115 @@
+name: Components Axci Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "modules/axconfig/**"
+      - "modules/axhal/**"
+      - "modules/axdriver/**"
+      - ".github/workflows/components-axci-test.yml"
+  pull_request:
+    paths:
+      - "modules/axconfig/**"
+      - "modules/axhal/**"
+      - "modules/axdriver/**"
+      - ".github/workflows/components-axci-test.yml"
+  workflow_dispatch:
+    inputs:
+      component:
+        description: "Component to test (all/axconfig/axhal/axdriver)"
+        required: false
+        default: "all"
+        type: string
+      test_targets:
+        description: "Override test targets (empty means per-component default)"
+        required: false
+        default: ""
+        type: string
+      base_ref:
+        description: "Base ref used when test_targets=auto"
+        required: false
+        default: "origin/main"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: components-axci-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.out.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build component matrix
+        id: out
+        run: |
+          set -e
+          EVENT="${{ github.event_name }}"
+          MANUAL_COMPONENT="${{ inputs.component }}"
+
+          all_matrix='[
+            {"crate_name":"axconfig","manifest_path":"modules/axconfig/Cargo.toml","default_targets":"axvisor-qemu-aarch64-arceos"},
+            {"crate_name":"axhal","manifest_path":"modules/axhal/Cargo.toml","default_targets":"axvisor-qemu-aarch64-arceos"},
+            {"crate_name":"axdriver","manifest_path":"modules/axdriver/Cargo.toml","default_targets":"axvisor-qemu-aarch64-arceos"}
+          ]'
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            if [ -z "$MANUAL_COMPONENT" ] || [ "$MANUAL_COMPONENT" = "all" ]; then
+              echo "matrix=$all_matrix" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            single=$(echo "$all_matrix" | jq -c --arg c "$MANUAL_COMPONENT" '[.[] | select(.crate_name == $c)]')
+            echo "matrix=$single" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$EVENT" = "pull_request" ]; then
+            BASE_REF="origin/${{ github.base_ref }}"
+            CHANGED="$(git diff --name-only "$BASE_REF"...HEAD 2>/dev/null || true)"
+          else
+            BEFORE="${{ github.event.before }}"
+            if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+              CHANGED="$(git diff --name-only "$BEFORE"...HEAD 2>/dev/null || true)"
+            else
+              CHANGED="$(git diff --name-only HEAD~1 2>/dev/null || true)"
+            fi
+          fi
+
+          pick='[]'
+          if printf '%s\n' "$CHANGED" | jq -R -s 'split("\n") | any(.[]; startswith("modules/axconfig/"))' | grep -q true; then
+            pick=$(echo "$pick" | jq -c '. + [{"crate_name":"axconfig","manifest_path":"modules/axconfig/Cargo.toml","default_targets":"axvisor-qemu-aarch64-arceos"}]')
+          fi
+          if printf '%s\n' "$CHANGED" | jq -R -s 'split("\n") | any(.[]; startswith("modules/axhal/"))' | grep -q true; then
+            pick=$(echo "$pick" | jq -c '. + [{"crate_name":"axhal","manifest_path":"modules/axhal/Cargo.toml","default_targets":"axvisor-qemu-aarch64-arceos"}]')
+          fi
+          if printf '%s\n' "$CHANGED" | jq -R -s 'split("\n") | any(.[]; startswith("modules/axdriver/"))' | grep -q true; then
+            pick=$(echo "$pick" | jq -c '. + [{"crate_name":"axdriver","manifest_path":"modules/axdriver/Cargo.toml","default_targets":"axvisor-qemu-aarch64-arceos"}]')
+          fi
+
+          echo "Changed files:"
+          printf '%s\n' "$CHANGED"
+          echo "Selected matrix: $pick"
+          echo "matrix=$pick" >> "$GITHUB_OUTPUT"
+
+  test-components:
+    needs: detect
+    if: needs.detect.outputs.matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.detect.outputs.matrix) }}
+    uses: yoinspiration/axci/.github/workflows/test.yml@feat/ci-test-selection-hardening
+    with:
+      crate_name: ${{ matrix.crate_name }}
+      test_targets: ${{ inputs.test_targets != '' && inputs.test_targets || matrix.default_targets }}
+      base_ref: ${{ inputs.base_ref != '' && inputs.base_ref || 'origin/main' }}
