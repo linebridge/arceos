@@ -1,0 +1,111 @@
+name: Axconfig Axci Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "modules/axconfig/**"
+      - ".github/workflows/axconfig-axci-test.yml"
+  pull_request:
+    paths:
+      - "modules/axconfig/**"
+      - ".github/workflows/axconfig-axci-test.yml"
+  workflow_dispatch:
+    inputs:
+      test_targets:
+        description: "Test targets for axci workflow"
+        required: false
+        default: "starry-aarch64"
+        type: string
+      base_ref:
+        description: "Base ref used when test_targets=auto"
+        required: false
+        default: "origin/main"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: axconfig-axci-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  precheck-starry-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide whether Starry precheck is needed
+        id: scope
+        run: |
+          REQUESTED="${{ github.event_name == 'workflow_dispatch' && inputs.test_targets || 'starry-aarch64' }}"
+          if [[ "$REQUESTED" == "all" || "$REQUESTED" == "auto" || "$REQUESTED" == *"starry"* ]]; then
+            echo "run_precheck=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_precheck=false" >> "$GITHUB_OUTPUT"
+            echo "Skip Starry precheck for targets: $REQUESTED"
+          fi
+
+      - name: Checkout arceos
+        if: steps.scope.outputs.run_precheck == 'true'
+        uses: actions/checkout@v4
+
+      - name: Resolve local axconfig version
+        if: steps.scope.outputs.run_precheck == 'true'
+        id: local
+        run: |
+          VER=$(cargo metadata --manifest-path modules/axconfig/Cargo.toml --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name=="axconfig") | .version')
+          if [ -z "$VER" ] || [ "$VER" = "null" ]; then
+            echo "Failed to resolve local axconfig version"
+            exit 1
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Local axconfig version: $VER"
+
+      - name: Checkout StarryOS
+        if: steps.scope.outputs.run_precheck == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: Starry-OS/StarryOS
+          ref: main
+          path: starry
+
+      - name: Verify Starry lock can use local axconfig
+        if: steps.scope.outputs.run_precheck == 'true'
+        env:
+          LOCAL_AXCONFIG_VERSION: ${{ steps.local.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os, sys, tomllib
+
+          local_ver = os.environ["LOCAL_AXCONFIG_VERSION"]
+          lock_path = "starry/Cargo.lock"
+          with open(lock_path, "rb") as f:
+              lock = tomllib.load(f)
+
+          versions = sorted({
+              pkg.get("version")
+              for pkg in lock.get("package", [])
+              if pkg.get("name") == "axconfig" and pkg.get("version")
+          })
+
+          if not versions:
+              print("ERROR: Starry Cargo.lock does not contain axconfig; cannot validate patch hit.")
+              sys.exit(1)
+
+          print(f"Starry locked axconfig versions: {versions}")
+          print(f"Local axconfig version: {local_ver}")
+
+          if local_ver not in versions:
+              print("ERROR: Local axconfig version is not present in Starry Cargo.lock.")
+              print("Patch is likely ignored. Align version before running axci test.")
+              sys.exit(1)
+          PY
+
+  axconfig-integration:
+    needs: precheck-starry-compat
+    uses: arceos-hypervisor/axci/.github/workflows/test.yml@main
+    with:
+      crate_name: axconfig
+      test_targets: ${{ github.event_name == 'workflow_dispatch' && inputs.test_targets || 'starry-aarch64' }}
+      base_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.base_ref || 'origin/main' }}
