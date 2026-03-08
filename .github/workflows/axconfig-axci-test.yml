@@ -104,7 +104,7 @@ jobs:
 
   axconfig-integration:
     needs: precheck-starry-compat
-    uses: arceos-hypervisor/axci/.github/workflows/test.yml@main
+    uses: yoinspiration/axci/.github/workflows/test.yml@feat/ci-test-selection-hardening
     with:
       crate_name: axconfig
       test_targets: ${{ github.event_name == 'workflow_dispatch' && inputs.test_targets || 'starry-aarch64' }}
