@@ -15,7 +15,7 @@ on:
       test_targets:
         description: "Test targets for axci workflow"
         required: false
-        default: "starry-aarch64"
+        default: "axvisor-qemu-aarch64-arceos"
         type: string
       base_ref:
         description: "Base ref used when test_targets=auto"
@@ -37,7 +37,7 @@ jobs:
       - name: Decide whether Starry precheck is needed
         id: scope
         run: |
-          REQUESTED="${{ github.event_name == 'workflow_dispatch' && inputs.test_targets || 'starry-aarch64' }}"
+          REQUESTED="${{ github.event_name == 'workflow_dispatch' && inputs.test_targets || 'axvisor-qemu-aarch64-arceos' }}"
           if [[ "$REQUESTED" == "all" || "$REQUESTED" == "auto" || "$REQUESTED" == *"starry"* ]]; then
             echo "run_precheck=true" >> "$GITHUB_OUTPUT"
           else
@@ -107,5 +107,5 @@ jobs:
     uses: yoinspiration/axci/.github/workflows/test.yml@feat/ci-test-selection-hardening
     with:
       crate_name: axconfig
-      test_targets: ${{ github.event_name == 'workflow_dispatch' && inputs.test_targets || 'starry-aarch64' }}
+      test_targets: ${{ github.event_name == 'workflow_dispatch' && inputs.test_targets || 'axvisor-qemu-aarch64-arceos' }}
       base_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.base_ref || 'origin/main' }}
