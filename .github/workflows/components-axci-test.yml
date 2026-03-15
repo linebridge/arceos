@@ -109,9 +109,10 @@ jobs:
           fi
 
           cargo metadata --format-version 1 --no-deps > metadata.json
-          AFFECTED=$(python3 - changed_files.txt "$MAP_FILE" << 'PY'
+          RESULT=$(python3 - changed_files.txt "$MAP_FILE" << 'PY'
           import json, os, sys
           from collections import deque
+          import fnmatch
 
           with open("metadata.json") as f:
               meta = json.load(f)
@@ -130,7 +131,7 @@ jobs:
               return any(p.startswith(d) for d in skip_dirs) or any(p.endswith(e) for e in skip_exts) or p in skip_files
           changed = [f for f in changed if not is_non_code(f)]
           if not changed:
-              print(json.dumps([]))
+              print(json.dumps({"to_run": [], "reason": "no_code_or_empty"}))
               sys.exit(0)
 
           # pkg id -> name, name -> manifest_path (relative dir for prefix match)
@@ -186,26 +187,43 @@ jobs:
           components = mapping.get("components", [])
           testable = {c["crate_name"] for c in components}
           force_all = {c["crate_name"] for c in components if c.get("force_all", False)}
+          run_all_patterns = mapping.get("run_all_patterns", [])
+
+          for f in changed:
+              for p in run_all_patterns:
+                  if fnmatch.fnmatch(f, p):
+                      print(json.dumps({
+                          "to_run": sorted(testable),
+                          "reason": f"run_all_pattern:{f}"
+                      }))
+                      sys.exit(0)
 
           if affected & force_all:
+              reason = "force_all:" + ",".join(sorted(affected & force_all))
               to_run = sorted(testable)
           else:
+              reason = "dependency_aware"
               to_run = sorted(affected & testable)
-          print(json.dumps(to_run))
+          if not to_run:
+              reason = "no_affected_testable"
+          print(json.dumps({"to_run": to_run, "reason": reason}))
           PY
           )
+          AFFECTED="$(echo "$RESULT" | jq -c '.to_run // []')"
+          REASON="$(echo "$RESULT" | jq -r '.reason // "unknown"')"
           echo "Changed crates (from paths): (see Python output above)"
           echo "Affected components to test: $AFFECTED"
+          echo "Selection reason: $REASON"
 
           if [ -z "$AFFECTED" ] || [ "$AFFECTED" = "[]" ]; then
             echo "matrix=[]" >> "$GITHUB_OUTPUT"
-            echo "summary=no affected testable components" >> "$GITHUB_OUTPUT"
+            echo "summary=no affected testable components ($REASON)" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           pick=$(echo "$ALL_MATRIX" | jq -c --argjson names "$AFFECTED" '[.[] | select(.crate_name as $c | ($names | index($c)) != null)]')
           echo "matrix=$pick" >> "$GITHUB_OUTPUT"
-          echo "summary=dependency-aware: $AFFECTED" >> "$GITHUB_OUTPUT"
+          echo "summary=dependency-aware($REASON): $AFFECTED" >> "$GITHUB_OUTPUT"
 
   test-components:
     needs: detect

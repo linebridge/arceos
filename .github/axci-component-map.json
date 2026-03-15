@@ -1,4 +1,10 @@
 {
+  "run_all_patterns": [
+    ".github/workflows/components-axci-test.yml",
+    ".github/axci-component-map.json",
+    "Cargo.lock",
+    "rust-toolchain.toml"
+  ],
   "components": [
     {
       "crate_name": "axconfig",
