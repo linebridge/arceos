@@ -69,7 +69,7 @@ jobs:
             BASE="${{ inputs.base_ref }}"
           fi
           echo "base_ref=$BASE" >> "$GITHUB_OUTPUT"
-          git diff --name-only "$BASE"...HEAD 2>/dev/null || git diff --name-only HEAD~1 2>/dev/null || true > changed_files.txt
+          { git diff --name-only "$BASE"...HEAD 2>/dev/null || git diff --name-only HEAD~1 2>/dev/null || true; } > changed_files.txt
           echo "Changed files:"
           cat changed_files.txt
 
@@ -110,7 +110,7 @@ jobs:
               changed = [l.strip() for l in f.read().splitlines() if l.strip()]
 
           # non-code filter
-          skip_dirs, skip_exts = ["doc/"], [".md", ".txt", ".png", ".jpg", ".jpeg", ".svg", ".gif"]
+          skip_dirs, skip_exts = ["doc/", "docs/"], [".md", ".txt", ".png", ".jpg", ".jpeg", ".svg", ".gif"]
           skip_files = ["LICENSE", ".gitignore", ".gitattributes"]
           def is_non_code(p):
               return any(p.startswith(d) for d in skip_dirs) or any(p.endswith(e) for e in skip_exts) or p in skip_files
