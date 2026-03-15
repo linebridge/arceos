@@ -149,7 +149,7 @@ jobs:
 
           # reverse deps: name -> set of names that depend on it
           rev = {}
-          for n in meta.get("resolve", {}).get("nodes", []):
+          for n in (meta.get("resolve") or {}).get("nodes", []):
               me = id_to_name.get(n["id"])
               if me is None:
                   continue
