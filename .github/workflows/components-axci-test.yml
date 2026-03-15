@@ -256,7 +256,7 @@ jobs:
 
   test-components:
     needs: detect
-    if: needs.detect.outputs.matrix != '[]' && needs.detect.outputs.reason != 'dependency_aware'
+    if: needs.detect.outputs.matrix != '[]' && (startsWith(needs.detect.outputs.reason, 'manual_') || startsWith(needs.detect.outputs.reason, 'force_all'))
     strategy:
       fail-fast: false
       matrix:
