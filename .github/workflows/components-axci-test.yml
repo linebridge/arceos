@@ -47,6 +47,7 @@ jobs:
     outputs:
       matrix: ${{ steps.out.outputs.matrix }}
       summary: ${{ steps.out.outputs.summary }}
+      reason: ${{ steps.out.outputs.reason }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -86,6 +87,7 @@ jobs:
           if [ ! -f "$MAP_FILE" ]; then
             echo "matrix=[]" >> "$GITHUB_OUTPUT"
             echo "summary=missing map file: $MAP_FILE" >> "$GITHUB_OUTPUT"
+            echo "reason=missing_map_file" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -95,16 +97,19 @@ jobs:
             if [ "$MANUAL_COMPONENT" = "all" ]; then
               echo "matrix=$ALL_MATRIX" >> "$GITHUB_OUTPUT"
               echo "summary=manual: all components" >> "$GITHUB_OUTPUT"
+              echo "reason=manual_all" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             single=$(echo "$ALL_MATRIX" | jq -c --arg c "$MANUAL_COMPONENT" '[.[] | select(.crate_name == $c)]')
             if [ "$single" = "[]" ]; then
               echo "matrix=[]" >> "$GITHUB_OUTPUT"
               echo "summary=manual: unknown component '$MANUAL_COMPONENT'" >> "$GITHUB_OUTPUT"
+              echo "reason=manual_unknown_component" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             echo "matrix=$single" >> "$GITHUB_OUTPUT"
             echo "summary=manual: $MANUAL_COMPONENT" >> "$GITHUB_OUTPUT"
+            echo "reason=manual_single_component" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -218,16 +223,40 @@ jobs:
           if [ -z "$AFFECTED" ] || [ "$AFFECTED" = "[]" ]; then
             echo "matrix=[]" >> "$GITHUB_OUTPUT"
             echo "summary=no affected testable components ($REASON)" >> "$GITHUB_OUTPUT"
+            echo "reason=$REASON" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           pick=$(echo "$ALL_MATRIX" | jq -c --argjson names "$AFFECTED" '[.[] | select(.crate_name as $c | ($names | index($c)) != null)]')
           echo "matrix=$pick" >> "$GITHUB_OUTPUT"
           echo "summary=dependency-aware($REASON): $AFFECTED" >> "$GITHUB_OUTPUT"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+
+  component-self-check:
+    needs: detect
+    if: needs.detect.outputs.matrix != '[]' && needs.detect.outputs.reason == 'dependency_aware'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.detect.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: aarch64-unknown-none-softfloat
+
+      - name: Component check (no integration target duplication)
+        run: |
+          cargo check -p ${{ matrix.crate_name }} --target aarch64-unknown-none-softfloat -F qemu
 
   test-components:
     needs: detect
-    if: needs.detect.outputs.matrix != '[]'
+    if: needs.detect.outputs.matrix != '[]' && needs.detect.outputs.reason != 'dependency_aware'
     strategy:
       fail-fast: false
       matrix:
