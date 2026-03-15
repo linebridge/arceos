@@ -44,20 +44,43 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.out.outputs.matrix }}
+      summary: ${{ steps.out.outputs.summary }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Build component matrix
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Get base ref and changed files
+        id: git
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="origin/${{ github.base_ref }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            if [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+              BASE="${{ github.event.before }}"
+            else
+              BASE="HEAD~1"
+            fi
+          else
+            BASE="${{ inputs.base_ref }}"
+          fi
+          echo "base_ref=$BASE" >> "$GITHUB_OUTPUT"
+          git diff --name-only "$BASE"...HEAD 2>/dev/null || git diff --name-only HEAD~1 2>/dev/null || true > changed_files.txt
+          echo "Changed files:"
+          cat changed_files.txt
+
+      - name: Build component matrix (dependency-aware)
         id: out
         run: |
           set -e
           EVENT="${{ github.event_name }}"
           MANUAL_COMPONENT="${{ inputs.component }}"
 
-          all_matrix='[
+          ALL_MATRIX='[
             {"crate_name":"axconfig","manifest_path":"modules/axconfig/Cargo.toml","default_targets":"axvisor-qemu-aarch64-arceos"},
             {"crate_name":"axhal","manifest_path":"modules/axhal/Cargo.toml","default_targets":"axvisor-qemu-aarch64-arceos"},
             {"crate_name":"axdriver","manifest_path":"modules/axdriver/Cargo.toml","default_targets":"axvisor-qemu-aarch64-arceos"}
@@ -65,41 +88,104 @@ jobs:
 
           if [ "$EVENT" = "workflow_dispatch" ]; then
             if [ -z "$MANUAL_COMPONENT" ] || [ "$MANUAL_COMPONENT" = "all" ]; then
-              echo "matrix=$all_matrix" >> "$GITHUB_OUTPUT"
+              echo "matrix=$ALL_MATRIX" >> "$GITHUB_OUTPUT"
+              echo "summary=manual: all components" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            single=$(echo "$all_matrix" | jq -c --arg c "$MANUAL_COMPONENT" '[.[] | select(.crate_name == $c)]')
+            single=$(echo "$ALL_MATRIX" | jq -c --arg c "$MANUAL_COMPONENT" '[.[] | select(.crate_name == $c)]')
             echo "matrix=$single" >> "$GITHUB_OUTPUT"
+            echo "summary=manual: $MANUAL_COMPONENT" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          if [ "$EVENT" = "pull_request" ]; then
-            BASE_REF="origin/${{ github.base_ref }}"
-            CHANGED="$(git diff --name-only "$BASE_REF"...HEAD 2>/dev/null || true)"
-          else
-            BEFORE="${{ github.event.before }}"
-            if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
-              CHANGED="$(git diff --name-only "$BEFORE"...HEAD 2>/dev/null || true)"
-            else
-              CHANGED="$(git diff --name-only HEAD~1 2>/dev/null || true)"
-            fi
+          cargo metadata --format-version 1 --no-deps > metadata.json
+          AFFECTED=$(python3 - changed_files.txt << 'PY'
+          import json, os, sys
+          from collections import deque
+
+          with open("metadata.json") as f:
+              meta = json.load(f)
+          ws_root = os.path.normpath(meta["workspace_root"])
+          with open(sys.argv[1]) as f:
+              changed = [l.strip() for l in f.read().splitlines() if l.strip()]
+
+          # non-code filter
+          skip_dirs, skip_exts = ["doc/"], [".md", ".txt", ".png", ".jpg", ".jpeg", ".svg", ".gif"]
+          skip_files = ["LICENSE", ".gitignore", ".gitattributes"]
+          def is_non_code(p):
+              return any(p.startswith(d) for d in skip_dirs) or any(p.endswith(e) for e in skip_exts) or p in skip_files
+          changed = [f for f in changed if not is_non_code(f)]
+          if not changed:
+              print(json.dumps([]))
+              sys.exit(0)
+
+          # pkg id -> name, name -> manifest_path (relative dir for prefix match)
+          ws_ids = set(meta["workspace_members"])
+          id_to_name = {}
+          name_to_dir = {}
+          for p in meta["packages"]:
+              if p["id"] not in ws_ids:
+                  continue
+              id_to_name[p["id"]] = p["name"]
+              mp = p["manifest_path"]
+              if mp.startswith(ws_root):
+                  mp = os.path.relpath(mp, ws_root)
+              d = os.path.dirname(mp)
+              name_to_dir[p["name"]] = d + "/" if d else ""
+
+          # reverse deps: name -> set of names that depend on it
+          rev = {}
+          for n in meta["resolve"]["nodes"]:
+              me = id_to_name.get(n["id"])
+              if me is None:
+                  continue
+              for dep in n.get("deps", []):
+                  other = id_to_name.get(dep["pkg"])
+                  if other is not None:
+                      rev.setdefault(other, set()).add(me)
+
+          # map file -> crate (longest prefix)
+          def file_to_crate(path):
+              best = None
+              best_len = -1
+              for name, dir_ in name_to_dir.items():
+                  if dir_ and path.startswith(dir_) and len(dir_) > best_len:
+                      best, best_len = name, len(dir_)
+              return best
+
+          changed_crates = set()
+          for f in changed:
+              c = file_to_crate(f)
+              if c:
+                  changed_crates.add(c)
+
+          # BFS: all crates affected (changed + dependents)
+          affected = set(changed_crates)
+          q = deque(changed_crates)
+          while q:
+              cur = q.popleft()
+              for dep in rev.get(cur, []):
+                  if dep not in affected:
+                      affected.add(dep)
+                      q.append(dep)
+
+          TESTABLE = {"axconfig", "axhal", "axdriver"}
+          to_run = sorted(affected & TESTABLE)
+          print(json.dumps(to_run))
+          PY
+          )
+          echo "Changed crates (from paths): (see Python output above)"
+          echo "Affected components to test: $AFFECTED"
+
+          if [ -z "$AFFECTED" ] || [ "$AFFECTED" = "[]" ]; then
+            echo "matrix=[]" >> "$GITHUB_OUTPUT"
+            echo "summary=no affected testable components" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          pick='[]'
-          if printf '%s\n' "$CHANGED" | jq -R -s 'split("\n") | any(.[]; startswith("modules/axconfig/"))' | grep -q true; then
-            pick=$(echo "$pick" | jq -c '. + [{"crate_name":"axconfig","manifest_path":"modules/axconfig/Cargo.toml","default_targets":"axvisor-qemu-aarch64-arceos"}]')
-          fi
-          if printf '%s\n' "$CHANGED" | jq -R -s 'split("\n") | any(.[]; startswith("modules/axhal/"))' | grep -q true; then
-            pick=$(echo "$pick" | jq -c '. + [{"crate_name":"axhal","manifest_path":"modules/axhal/Cargo.toml","default_targets":"axvisor-qemu-aarch64-arceos"}]')
-          fi
-          if printf '%s\n' "$CHANGED" | jq -R -s 'split("\n") | any(.[]; startswith("modules/axdriver/"))' | grep -q true; then
-            pick=$(echo "$pick" | jq -c '. + [{"crate_name":"axdriver","manifest_path":"modules/axdriver/Cargo.toml","default_targets":"axvisor-qemu-aarch64-arceos"}]')
-          fi
-
-          echo "Changed files:"
-          printf '%s\n' "$CHANGED"
-          echo "Selected matrix: $pick"
+          pick=$(echo "$ALL_MATRIX" | jq -c --argjson names "$AFFECTED" '[.[] | select(.crate_name as $c | ($names | index($c)) != null)]')
           echo "matrix=$pick" >> "$GITHUB_OUTPUT"
+          echo "summary=dependency-aware: $AFFECTED" >> "$GITHUB_OUTPUT"
 
   test-components:
     needs: detect
