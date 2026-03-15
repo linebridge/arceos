@@ -8,6 +8,7 @@ on:
       - "**/Cargo.toml"
       - "Cargo.lock"
       - ".github/axci-component-map.json"
+      - ".github/axci-test-target-rules.json"
       - ".github/workflows/components-axci-test.yml"
   pull_request:
     paths:
@@ -15,6 +16,7 @@ on:
       - "**/Cargo.toml"
       - "Cargo.lock"
       - ".github/axci-component-map.json"
+      - ".github/axci-test-target-rules.json"
       - ".github/workflows/components-axci-test.yml"
   workflow_dispatch:
     inputs:
@@ -29,7 +31,7 @@ on:
         default: ""
         type: string
       base_ref:
-        description: "Base ref used when test_targets=auto"
+        description: "Base ref for dependency-aware detection"
         required: false
         default: "origin/main"
         type: string
@@ -45,19 +47,16 @@ jobs:
   detect:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.out.outputs.matrix }}
-      summary: ${{ steps.out.outputs.summary }}
-      reason: ${{ steps.out.outputs.reason }}
+      skip_all: ${{ steps.matrix.outputs.skip_all }}
+      integration_matrix: ${{ steps.matrix.outputs.integration_matrix }}
+      check_matrix: ${{ steps.matrix.outputs.check_matrix }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Get base ref and changed files
+      - name: Get base ref
         id: git
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -72,173 +71,152 @@ jobs:
             BASE="${{ inputs.base_ref }}"
           fi
           echo "base_ref=$BASE" >> "$GITHUB_OUTPUT"
-          { git diff --name-only "$BASE"...HEAD 2>/dev/null || git diff --name-only HEAD~1 2>/dev/null || true; } > changed_files.txt
-          echo "Changed files:"
-          cat changed_files.txt
 
-      - name: Build component matrix (dependency-aware)
-        id: out
+      - name: Checkout axci rules
+        uses: actions/checkout@v4
+        with:
+          repository: yoinspiration/axci
+          ref: test/auto-target-regression
+          path: axci-rules
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache axci-affected build
+        uses: actions/cache@v4
+        with:
+          path: axci-rules/axci-affected/target
+          key: axci-affected-${{ runner.os }}-${{ hashFiles('axci-rules/axci-affected/Cargo.lock') }}
+          restore-keys: axci-affected-${{ runner.os }}-
+
+      - name: Build axci-affected engine
+        id: build_engine
+        run: |
+          if (cd axci-rules/axci-affected && cargo build --release 2>/dev/null); then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build component matrices
+        id: matrix
         run: |
           set -e
           EVENT="${{ github.event_name }}"
           MANUAL_COMPONENT="${{ inputs.component }}"
           MAP_FILE=".github/axci-component-map.json"
+          RULES_FILE=".github/axci-test-target-rules.json"
+          BASE_REF="${{ steps.git.outputs.base_ref }}"
 
           if [ ! -f "$MAP_FILE" ]; then
-            echo "matrix=[]" >> "$GITHUB_OUTPUT"
-            echo "summary=missing map file: $MAP_FILE" >> "$GITHUB_OUTPUT"
-            echo "reason=missing_map_file" >> "$GITHUB_OUTPUT"
+            echo "skip_all=true" >> "$GITHUB_OUTPUT"
+            echo "integration_matrix=[]" >> "$GITHUB_OUTPUT"
+            echo "check_matrix=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          ALL_MATRIX="$(jq -c '.components | map({crate_name, manifest_path, default_targets, force_all: (.force_all // false)})' "$MAP_FILE")"
+          ALL=$(jq -c '.components | map({crate_name, manifest_path, default_targets, force_all: (.force_all // false)})' "$MAP_FILE")
 
+          # Manual dispatch: the specified component always runs a full integration test
           if [ "$EVENT" = "workflow_dispatch" ] && [ -n "$MANUAL_COMPONENT" ] && [ "$MANUAL_COMPONENT" != "auto" ]; then
             if [ "$MANUAL_COMPONENT" = "all" ]; then
-              echo "matrix=$ALL_MATRIX" >> "$GITHUB_OUTPUT"
-              echo "summary=manual: all components" >> "$GITHUB_OUTPUT"
-              echo "reason=manual_all" >> "$GITHUB_OUTPUT"
-              exit 0
+              INTEGRATION=$(echo "$ALL" | jq -c 'map({crate_name, manifest_path, default_targets})')
+            else
+              INTEGRATION=$(echo "$ALL" | jq -c --arg c "$MANUAL_COMPONENT" '[.[] | select(.crate_name == $c) | {crate_name, manifest_path, default_targets}]')
             fi
-            single=$(echo "$ALL_MATRIX" | jq -c --arg c "$MANUAL_COMPONENT" '[.[] | select(.crate_name == $c)]')
-            if [ "$single" = "[]" ]; then
-              echo "matrix=[]" >> "$GITHUB_OUTPUT"
-              echo "summary=manual: unknown component '$MANUAL_COMPONENT'" >> "$GITHUB_OUTPUT"
-              echo "reason=manual_unknown_component" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            echo "matrix=$single" >> "$GITHUB_OUTPUT"
-            echo "summary=manual: $MANUAL_COMPONENT" >> "$GITHUB_OUTPUT"
-            echo "reason=manual_single_component" >> "$GITHUB_OUTPUT"
+            echo "skip_all=false" >> "$GITHUB_OUTPUT"
+            echo "integration_matrix=$INTEGRATION" >> "$GITHUB_OUTPUT"
+            echo "check_matrix=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          cargo metadata --format-version 1 --no-deps > metadata.json
-          RESULT=$(python3 - changed_files.txt "$MAP_FILE" << 'PY'
-          import json, os, sys
-          from collections import deque
-          import fnmatch
+          # Auto detection: try axci-affected engine first, fall back to affected_crates.sh
+          TARGETS_JSON="null"
+          SKIP_ALL="false"
+          ENGINE="axci-rules/axci-affected/target/release/axci-affected"
 
-          with open("metadata.json") as f:
-              meta = json.load(f)
-          with open(sys.argv[2]) as f:
-              mapping = json.load(f)
-          ws_root = os.path.normpath(meta["workspace_root"])
-          with open(sys.argv[1]) as f:
-              changed = [l.strip() for l in f.read().splitlines() if l.strip()]
+          if [ "${{ steps.build_engine.outputs.built }}" = "true" ] && [ -x "$ENGINE" ]; then
+            ENGINE_OUT=$("$ENGINE" . "$BASE_REF" "$RULES_FILE" 2>/dev/null) || ENGINE_OUT=""
+            if [ -n "$ENGINE_OUT" ] && echo "$ENGINE_OUT" | jq -e '.skip_all != null and .targets != null' >/dev/null 2>&1; then
+              if [ "$(echo "$ENGINE_OUT" | jq -r '.skip_all')" = "true" ]; then
+                SKIP_ALL="true"
+                TARGETS_JSON="[]"
+              else
+                TARGETS_JSON=$(echo "$ENGINE_OUT" | jq -c '.targets')
+                echo "axci-affected targets: $TARGETS_JSON"
+              fi
+            fi
+          fi
 
-          # non-code filter
-          non_code = mapping.get("non_code", {})
-          skip_dirs = non_code.get("dirs", [])
-          skip_exts = non_code.get("exts", [])
-          skip_files = non_code.get("files", [])
-          def is_non_code(p):
-              return any(p.startswith(d) for d in skip_dirs) or any(p.endswith(e) for e in skip_exts) or p in skip_files
-          changed = [f for f in changed if not is_non_code(f)]
-          if not changed:
-              print(json.dumps({"to_run": [], "reason": "no_code_or_empty"}))
-              sys.exit(0)
+          # Bash fallback using affected_crates.sh
+          if [ "$TARGETS_JSON" = "null" ]; then
+            echo "Engine unavailable, falling back to affected_crates.sh"
+            AFFECTED_SCRIPT="axci-rules/scripts/affected_crates.sh"
+            CRATES_OUT=""
+            if [ -x "$AFFECTED_SCRIPT" ]; then
+              CRATES_OUT=$(bash "$AFFECTED_SCRIPT" . "$BASE_REF" 2>/dev/null) || CRATES_OUT=""
+            fi
 
-          # pkg id -> name, name -> manifest_path (relative dir for prefix match)
-          ws_ids = set(meta["workspace_members"])
-          id_to_name = {}
-          name_to_dir = {}
-          for p in meta["packages"]:
-              if p["id"] not in ws_ids:
-                  continue
-              id_to_name[p["id"]] = p["name"]
-              mp = p["manifest_path"]
-              if mp.startswith(ws_root):
-                  mp = os.path.relpath(mp, ws_root)
-              d = os.path.dirname(mp)
-              name_to_dir[p["name"]] = d + "/" if d else ""
+            if [ -z "$CRATES_OUT" ]; then
+              TARGETS_JSON=$(echo "$ALL" | jq -c '[.[].crate_name]')
+            else
+              CHANGED=$(echo "$CRATES_OUT" | jq -c '.changed_crates // []')
+              AFFECTED=$(echo "$CRATES_OUT" | jq -c '.affected_crates // []')
+              if [ "$(echo "$CHANGED" | jq 'length')" = "0" ]; then
+                # No code changes detected: check if there are any non-code-only changes
+                CHANGED_FILES=$(git diff --name-only "$BASE_REF" 2>/dev/null || git diff --name-only HEAD~1 2>/dev/null || true)
+                if [ -z "$CHANGED_FILES" ]; then
+                  SKIP_ALL="true"
+                  TARGETS_JSON="[]"
+                else
+                  # Changed files exist but no crate detected: safe fallback to run all
+                  TARGETS_JSON=$(echo "$ALL" | jq -c '[.[].crate_name]')
+                fi
+              else
+                TESTABLE=$(echo "$ALL" | jq -c '[.[].crate_name]')
+                # run_all_crates: if axconfig/axhal directly changed, run all
+                RUN_ALL_CRATES=$(jq -c '.run_all_crates // []' "$RULES_FILE" 2>/dev/null || echo "[]")
+                HAS_RUN_ALL=$(echo "$CHANGED" | jq --argjson rac "$RUN_ALL_CRATES" \
+                  '[ .[] | select(. as $c | ($rac | index($c)) != null) ] | length > 0')
+                if [ "$HAS_RUN_ALL" = "true" ]; then
+                  TARGETS_JSON="$TESTABLE"
+                else
+                  TARGETS_JSON=$(echo "$AFFECTED" | jq -c --argjson t "$TESTABLE" \
+                    '[ .[] | select(. as $c | ($t | index($c)) != null) ]')
+                  if [ "$TARGETS_JSON" = "[]" ]; then
+                    # Unrecognized code change: safe fallback to run all
+                    TARGETS_JSON="$TESTABLE"
+                  fi
+                fi
+              fi
+            fi
+          fi
 
-          # reverse deps: name -> set of names that depend on it
-          rev = {}
-          for n in (meta.get("resolve") or {}).get("nodes", []):
-              me = id_to_name.get(n["id"])
-              if me is None:
-                  continue
-              for dep in n.get("deps", []):
-                  other = id_to_name.get(dep["pkg"])
-                  if other is not None:
-                      rev.setdefault(other, set()).add(me)
-
-          # map file -> crate (longest prefix)
-          def file_to_crate(path):
-              best = None
-              best_len = -1
-              for name, dir_ in name_to_dir.items():
-                  if dir_ and path.startswith(dir_) and len(dir_) > best_len:
-                      best, best_len = name, len(dir_)
-              return best
-
-          changed_crates = set()
-          for f in changed:
-              c = file_to_crate(f)
-              if c:
-                  changed_crates.add(c)
-
-          # BFS: all crates affected (changed + dependents)
-          affected = set(changed_crates)
-          q = deque(changed_crates)
-          while q:
-              cur = q.popleft()
-              for dep in rev.get(cur, []):
-                  if dep not in affected:
-                      affected.add(dep)
-                      q.append(dep)
-
-          components = mapping.get("components", [])
-          testable = {c["crate_name"] for c in components}
-          force_all = {c["crate_name"] for c in components if c.get("force_all", False)}
-          run_all_patterns = mapping.get("run_all_patterns", [])
-
-          for f in changed:
-              for p in run_all_patterns:
-                  if fnmatch.fnmatch(f, p):
-                      print(json.dumps({
-                          "to_run": sorted(testable),
-                          "reason": f"run_all_pattern:{f}"
-                      }))
-                      sys.exit(0)
-
-          if affected & force_all:
-              reason = "force_all:" + ",".join(sorted(affected & force_all))
-              to_run = sorted(testable)
-          else:
-              reason = "dependency_aware"
-              to_run = sorted(affected & testable)
-          if not to_run:
-              reason = "no_affected_testable"
-          print(json.dumps({"to_run": to_run, "reason": reason}))
-          PY
-          )
-          AFFECTED="$(echo "$RESULT" | jq -c '.to_run // []')"
-          REASON="$(echo "$RESULT" | jq -r '.reason // "unknown"')"
-          echo "Changed crates (from paths): (see Python output above)"
-          echo "Affected components to test: $AFFECTED"
-          echo "Selection reason: $REASON"
-
-          if [ -z "$AFFECTED" ] || [ "$AFFECTED" = "[]" ]; then
-            echo "matrix=[]" >> "$GITHUB_OUTPUT"
-            echo "summary=no affected testable components ($REASON)" >> "$GITHUB_OUTPUT"
-            echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+          if [ "$SKIP_ALL" = "true" ]; then
+            echo "skip_all=true" >> "$GITHUB_OUTPUT"
+            echo "integration_matrix=[]" >> "$GITHUB_OUTPUT"
+            echo "check_matrix=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          pick=$(echo "$ALL_MATRIX" | jq -c --argjson names "$AFFECTED" '[.[] | select(.crate_name as $c | ($names | index($c)) != null)]')
-          echo "matrix=$pick" >> "$GITHUB_OUTPUT"
-          echo "summary=dependency-aware($REASON): $AFFECTED" >> "$GITHUB_OUTPUT"
-          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+          # Split by force_all: true → full integration test; false → cargo check only
+          INTEGRATION=$(echo "$ALL" | jq -c --argjson t "$TARGETS_JSON" \
+            '[.[] | select(.crate_name as $c | ($t | index($c)) != null) | select(.force_all == true) | {crate_name, manifest_path, default_targets}]')
+          CHECK=$(echo "$ALL" | jq -c --argjson t "$TARGETS_JSON" \
+            '[.[] | select(.crate_name as $c | ($t | index($c)) != null) | select(.force_all != true) | {crate_name, manifest_path, default_targets}]')
+
+          echo "skip_all=false" >> "$GITHUB_OUTPUT"
+          echo "integration_matrix=$INTEGRATION" >> "$GITHUB_OUTPUT"
+          echo "check_matrix=$CHECK" >> "$GITHUB_OUTPUT"
+          echo "Detection complete: integration=$(echo "$INTEGRATION" | jq -c '[.[].crate_name]') check=$(echo "$CHECK" | jq -c '[.[].crate_name]')"
 
   component-self-check:
     needs: detect
-    if: needs.detect.outputs.matrix != '[]' && needs.detect.outputs.reason == 'dependency_aware'
+    if: needs.detect.outputs.skip_all != 'true' && needs.detect.outputs.check_matrix != '[]'
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJson(needs.detect.outputs.matrix) }}
+        include: ${{ fromJson(needs.detect.outputs.check_matrix) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -250,18 +228,17 @@ jobs:
           components: rust-src
           targets: aarch64-unknown-none-softfloat
 
-      - name: Component check (no integration target duplication)
-        run: |
-          cargo check -p ${{ matrix.crate_name }} --target aarch64-unknown-none-softfloat -F qemu
+      - name: Component check
+        run: cargo check -p ${{ matrix.crate_name }} --target aarch64-unknown-none-softfloat -F qemu
 
   test-components:
     needs: detect
-    if: needs.detect.outputs.matrix != '[]' && (startsWith(needs.detect.outputs.reason, 'manual_') || startsWith(needs.detect.outputs.reason, 'force_all'))
+    if: needs.detect.outputs.skip_all != 'true' && needs.detect.outputs.integration_matrix != '[]'
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJson(needs.detect.outputs.matrix) }}
-    uses: yoinspiration/axci/.github/workflows/test.yml@feat/ci-test-selection-hardening
+        include: ${{ fromJson(needs.detect.outputs.integration_matrix) }}
+    uses: yoinspiration/axci/.github/workflows/test.yml@test/auto-target-regression
     with:
       crate_name: ${{ matrix.crate_name }}
       test_targets: ${{ inputs.test_targets != '' && inputs.test_targets || matrix.default_targets }}

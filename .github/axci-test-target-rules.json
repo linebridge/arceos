@@ -1,0 +1,48 @@
+{
+  "non_code": {
+    "dirs": [
+      "doc/",
+      "docs/"
+    ],
+    "exts": [
+      ".md",
+      ".txt",
+      ".png",
+      ".jpg",
+      ".jpeg",
+      ".svg",
+      ".gif"
+    ],
+    "files": [
+      "LICENSE",
+      ".gitignore",
+      ".gitattributes"
+    ]
+  },
+  "run_all_patterns": [
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    ".github/axci-component-map.json",
+    ".github/workflows/components-axci-test.yml"
+  ],
+  "run_all_exclude_patterns": [],
+  "selection_rules": [],
+  "target_order": [
+    "axconfig",
+    "axhal",
+    "axdriver"
+  ],
+  "run_all_crates": [
+    "axconfig",
+    "axhal"
+  ],
+  "crate_rules": [
+    {
+      "id": "axdriver_affected",
+      "crates": ["axdriver"],
+      "targets": ["axdriver"],
+      "direct_only": false
+    }
+  ],
+  "crate_path_rules": []
+}
