@@ -203,7 +203,7 @@ jobs:
           INTEGRATION=$(echo "$ALL" | jq -c --argjson t "$TARGETS_JSON" \
             '[.[] | select(.crate_name as $c | ($t | index($c)) != null) | select(.force_all == true) | {crate_name, manifest_path, default_targets}]')
           CHECK=$(echo "$ALL" | jq -c --argjson t "$TARGETS_JSON" \
-            '[.[] | select(.crate_name as $c | ($t | index($c)) != null) | select(.force_all != true) | {crate_name, manifest_path, default_targets}]')
+            '[.[] | select(.crate_name as $c | ($t | index($c)) != null) | select(.force_all != true) | {crate_name, manifest_path, default_targets, check_features: (.check_features // "")}]')
 
           echo "skip_all=false" >> "$GITHUB_OUTPUT"
           echo "integration_matrix=$INTEGRATION" >> "$GITHUB_OUTPUT"
@@ -229,7 +229,12 @@ jobs:
           targets: aarch64-unknown-none-softfloat
 
       - name: Component check
-        run: cargo check -p ${{ matrix.crate_name }} --target aarch64-unknown-none-softfloat -F qemu
+        run: |
+          EXTRA=""
+          if [ -n "${{ matrix.check_features }}" ]; then
+            EXTRA="--features ${{ matrix.check_features }}"
+          fi
+          cargo check -p ${{ matrix.crate_name }} --target aarch64-unknown-none-softfloat $EXTRA
 
   test-components:
     needs: detect

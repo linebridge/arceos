@@ -22,7 +22,8 @@
       "crate_name": "axdriver",
       "manifest_path": "modules/axdriver/Cargo.toml",
       "default_targets": "axvisor-qemu-aarch64-arceos",
-      "force_all": false
+      "force_all": false,
+      "check_features": "axhal/myplat"
     }
   ],
   "non_code": {
