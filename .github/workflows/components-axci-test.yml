@@ -4,22 +4,24 @@ on:
   push:
     branches: [main]
     paths:
-      - "modules/axconfig/**"
-      - "modules/axhal/**"
-      - "modules/axdriver/**"
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - ".github/axci-component-map.json"
       - ".github/workflows/components-axci-test.yml"
   pull_request:
     paths:
-      - "modules/axconfig/**"
-      - "modules/axhal/**"
-      - "modules/axdriver/**"
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - ".github/axci-component-map.json"
       - ".github/workflows/components-axci-test.yml"
   workflow_dispatch:
     inputs:
       component:
-        description: "Component to test (all/axconfig/axhal/axdriver)"
+        description: "Component to test (auto/all/axconfig/axhal/axdriver)"
         required: false
-        default: "all"
+        default: "auto"
         type: string
       test_targets:
         description: "Override test targets (empty means per-component default)"
@@ -79,39 +81,51 @@ jobs:
           set -e
           EVENT="${{ github.event_name }}"
           MANUAL_COMPONENT="${{ inputs.component }}"
+          MAP_FILE=".github/axci-component-map.json"
 
-          ALL_MATRIX='[
-            {"crate_name":"axconfig","manifest_path":"modules/axconfig/Cargo.toml","default_targets":"axvisor-qemu-aarch64-arceos"},
-            {"crate_name":"axhal","manifest_path":"modules/axhal/Cargo.toml","default_targets":"axvisor-qemu-aarch64-arceos"},
-            {"crate_name":"axdriver","manifest_path":"modules/axdriver/Cargo.toml","default_targets":"axvisor-qemu-aarch64-arceos"}
-          ]'
+          if [ ! -f "$MAP_FILE" ]; then
+            echo "matrix=[]" >> "$GITHUB_OUTPUT"
+            echo "summary=missing map file: $MAP_FILE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-          if [ "$EVENT" = "workflow_dispatch" ]; then
-            if [ -z "$MANUAL_COMPONENT" ] || [ "$MANUAL_COMPONENT" = "all" ]; then
+          ALL_MATRIX="$(jq -c '.components | map({crate_name, manifest_path, default_targets, force_all: (.force_all // false)})' "$MAP_FILE")"
+
+          if [ "$EVENT" = "workflow_dispatch" ] && [ -n "$MANUAL_COMPONENT" ] && [ "$MANUAL_COMPONENT" != "auto" ]; then
+            if [ "$MANUAL_COMPONENT" = "all" ]; then
               echo "matrix=$ALL_MATRIX" >> "$GITHUB_OUTPUT"
               echo "summary=manual: all components" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             single=$(echo "$ALL_MATRIX" | jq -c --arg c "$MANUAL_COMPONENT" '[.[] | select(.crate_name == $c)]')
+            if [ "$single" = "[]" ]; then
+              echo "matrix=[]" >> "$GITHUB_OUTPUT"
+              echo "summary=manual: unknown component '$MANUAL_COMPONENT'" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             echo "matrix=$single" >> "$GITHUB_OUTPUT"
             echo "summary=manual: $MANUAL_COMPONENT" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           cargo metadata --format-version 1 --no-deps > metadata.json
-          AFFECTED=$(python3 - changed_files.txt << 'PY'
+          AFFECTED=$(python3 - changed_files.txt "$MAP_FILE" << 'PY'
           import json, os, sys
           from collections import deque
 
           with open("metadata.json") as f:
               meta = json.load(f)
+          with open(sys.argv[2]) as f:
+              mapping = json.load(f)
           ws_root = os.path.normpath(meta["workspace_root"])
           with open(sys.argv[1]) as f:
               changed = [l.strip() for l in f.read().splitlines() if l.strip()]
 
           # non-code filter
-          skip_dirs, skip_exts = ["doc/", "docs/"], [".md", ".txt", ".png", ".jpg", ".jpeg", ".svg", ".gif"]
-          skip_files = ["LICENSE", ".gitignore", ".gitattributes"]
+          non_code = mapping.get("non_code", {})
+          skip_dirs = non_code.get("dirs", [])
+          skip_exts = non_code.get("exts", [])
+          skip_files = non_code.get("files", [])
           def is_non_code(p):
               return any(p.startswith(d) for d in skip_dirs) or any(p.endswith(e) for e in skip_exts) or p in skip_files
           changed = [f for f in changed if not is_non_code(f)]
@@ -135,7 +149,7 @@ jobs:
 
           # reverse deps: name -> set of names that depend on it
           rev = {}
-          for n in meta["resolve"]["nodes"]:
+          for n in meta.get("resolve", {}).get("nodes", []):
               me = id_to_name.get(n["id"])
               if me is None:
                   continue
@@ -169,8 +183,14 @@ jobs:
                       affected.add(dep)
                       q.append(dep)
 
-          TESTABLE = {"axconfig", "axhal", "axdriver"}
-          to_run = sorted(affected & TESTABLE)
+          components = mapping.get("components", [])
+          testable = {c["crate_name"] for c in components}
+          force_all = {c["crate_name"] for c in components if c.get("force_all", False)}
+
+          if affected & force_all:
+              to_run = sorted(testable)
+          else:
+              to_run = sorted(affected & testable)
           print(json.dumps(to_run))
           PY
           )
